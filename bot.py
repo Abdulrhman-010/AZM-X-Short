@@ -3,10 +3,17 @@ import json
 import re
 import string
 import random
+import logging
 from datetime import datetime
-from flask import Flask, request
+from flask import Flask, request, redirect, jsonify
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+
+# ===========================
+# إعداد السجلات (Logging)
+# ===========================
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # ===========================
 # إعدادات التطبيق
@@ -16,11 +23,18 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
 BASE_URL = os.environ.get("BASE_URL", "https://azmx-shortener.railway.app")
 
+# تحقق من وجود المتغيرات الضرورية
+if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
+    logger.error("❌ SLACK_BOT_TOKEN أو SLACK_SIGNING_SECRET غير موجود!")
+    raise ValueError("Missing required environment variables")
+
+logger.info(f"✅ البوت يبدأ بـ BASE_URL: {BASE_URL}")
+
 # تهيئة تطبيق Slack
 app = App(
     token=SLACK_BOT_TOKEN,
     signing_secret=SLACK_SIGNING_SECRET,
-    process_before_response=True
+    process_before_response=True  # معالجة الطلب بشكل غير متزامن
 )
 
 # تهيئة Flask
@@ -77,12 +91,14 @@ DB_FILE = "links.json"
 
 def load_links():
     """تحميل قاعدة البيانات من ملف JSON"""
-    if os.path.exists(DB_FILE):
-        try:
+    try:
+        if os.path.exists(DB_FILE):
             with open(DB_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {}
+                data = json.load(f)
+                logger.debug(f"✅ تم تحميل {len(data)} رابط من قاعدة البيانات")
+                return data
+    except Exception as e:
+        logger.error(f"❌ خطأ في قراءة قاعدة البيانات: {e}")
     return {}
 
 def save_links(links_db):
@@ -90,49 +106,62 @@ def save_links(links_db):
     try:
         with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(links_db, f, ensure_ascii=False, indent=2)
-    except IOError as e:
-        print(f"Error saving database: {e}")
+        logger.debug(f"✅ تم حفظ قاعدة البيانات ({len(links_db)} روابط)")
+    except Exception as e:
+        logger.error(f"❌ خطأ في حفظ قاعدة البيانات: {e}")
 
 def generate_short_code(length=6):
-    """توليد كود قصير عشوائي"""
+    """توليد كود قصير عشوائي فريد"""
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for _ in range(length))
 
 def is_valid_url(url):
-    """التحقق من صحة الرابط"""
+    """التحقق من صحة الرابط بدقة أعلى"""
     url_pattern = re.compile(
         r'^https?://'  # البروتوكول
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # النطاق
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)*[A-Z]{2,}\.?|'  # النطاق
         r'localhost|'  # localhost
         r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # عنوان IP
         r'(?::\d+)?'  # المنفذ
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return url_pattern.match(url) is not None
+    
+    try:
+        return url_pattern.match(url) is not None
+    except Exception as e:
+        logger.error(f"❌ خطأ في التحقق من الرابط: {e}")
+        return False
 
 def create_short_url(original_url):
-    """إنشاء رابط مختصر جديد"""
-    links_db = load_links()
-    
-    # البحث عن رابط موجود مسبقاً
-    for short_code, data in links_db.items():
-        if data.get("original_url") == original_url:
-            return short_code
-    
-    # توليد كود جديد فريد
-    while True:
-        short_code = generate_short_code()
-        if short_code not in links_db:
-            break
-    
-    # حفظ الرابط
-    links_db[short_code] = {
-        "original_url": original_url,
-        "created_at": datetime.utcnow().isoformat(),
-        "clicks": 0
-    }
-    save_links(links_db)
-    
-    return short_code
+    """إنشاء رابط مختصر جديد أو إرجاع موجود"""
+    try:
+        links_db = load_links()
+        
+        # البحث عن رابط موجود مسبقاً
+        for short_code, data in links_db.items():
+            if data.get("original_url") == original_url:
+                logger.info(f"♻️ الرابط موجود مسبقاً: {short_code}")
+                return short_code
+        
+        # توليد كود جديد فريد
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            short_code = generate_short_code()
+            if short_code not in links_db:
+                break
+        
+        # حفظ الرابط
+        links_db[short_code] = {
+            "original_url": original_url,
+            "created_at": datetime.utcnow().isoformat(),
+            "clicks": 0
+        }
+        save_links(links_db)
+        logger.info(f"✅ رابط مختصر جديد: {short_code}")
+        
+        return short_code
+    except Exception as e:
+        logger.error(f"❌ خطأ في إنشاء الرابط المختصر: {e}")
+        raise
 
 # ===========================
 # أوامر Slack
@@ -141,13 +170,19 @@ def create_short_url(original_url):
 @app.command("/short")
 def handle_short_command(ack, body, respond):
     """معالج أمر Slash /short"""
+    
+    # رد فوري لـ Slack (مهم جداً!)
     ack()
     
     try:
         text = body.get("text", "").strip()
+        user_id = body.get("user_id", "unknown")
+        
+        logger.info(f"📨 أمر /short من {user_id}: {text[:50]}")
         
         # التحقق من وجود رابط
         if not text:
+            logger.warning(f"⚠️ لا توجد نصوص من {user_id}")
             respond(
                 text=f"{MESSAGES['ERROR_NO_URL']['ar']}\n\n{MESSAGES['HELP']['ar']}"
             )
@@ -157,6 +192,7 @@ def handle_short_command(ack, body, respond):
         urls = re.findall(r'https?://[^\s]+', text)
         
         if not urls:
+            logger.warning(f"⚠️ لا توجد روابط في النص من {user_id}")
             respond(
                 text=f"{MESSAGES['ERROR_NO_URL']['ar']}\n\n{MESSAGES['HELP']['ar']}"
             )
@@ -166,6 +202,7 @@ def handle_short_command(ack, body, respond):
         
         # التحقق من صحة الرابط
         if not is_valid_url(original_url):
+            logger.warning(f"⚠️ رابط غير صحيح من {user_id}: {original_url}")
             respond(
                 text=f"{MESSAGES['ERROR_INVALID_URL']['ar']}"
             )
@@ -175,24 +212,23 @@ def handle_short_command(ack, body, respond):
         short_code = create_short_url(original_url)
         short_url = f"{BASE_URL}/{short_code}"
         
-        # تشكيل الرسالة
+        # تشكيل الرسالة بصيغة Block Kit (أفضل وأجمل)
         message_text = (
             f"{MESSAGES['SUCCESS']['ar']}\n\n"
             f"*{MESSAGES['ORIGINAL_URL']['ar']}*\n"
             f"`{original_url}`\n\n"
             f"*{MESSAGES['SHORT_URL']['ar']}*\n"
             f"`{short_url}`\n\n"
-            f"_{MESSAGES['COPY_HINT']['ar']}_\n\n"
-            f"---\n"
             f"_{MESSAGES['THANK_YOU']['ar']}_"
         )
         
+        logger.info(f"✅ رسالة نجاح مرسلة إلى {user_id}")
         respond(text=message_text)
     
     except Exception as e:
-        print(f"Error in /short command: {e}")
+        logger.error(f"❌ خطأ في معالجة الأمر: {e}", exc_info=True)
         respond(
-            text=f"{MESSAGES['ERROR_GENERAL']['ar']}"
+            text=f"{MESSAGES['ERROR_GENERAL']['ar']}\n(Error: {str(e)[:50]})"
         )
 
 # ===========================
@@ -202,28 +238,30 @@ def handle_short_command(ack, body, respond):
 @flask_app.route("/<short_code>", methods=["GET"])
 def redirect_short_url(short_code):
     """توجيه الرابط المختصر إلى الرابط الأصلي"""
-    links_db = load_links()
-    
-    if short_code in links_db:
-        link_data = links_db[short_code]
-        original_url = link_data.get("original_url")
+    try:
+        logger.info(f"🔗 محاولة إعادة توجيه: {short_code}")
         
-        # تحديث عدد النقرات
-        link_data["clicks"] = link_data.get("clicks", 0) + 1
-        save_links(links_db)
+        links_db = load_links()
         
-        # توجيه 302
-        return {
-            "statusCode": 302,
-            "headers": {
-                "Location": original_url
-            }
-        }
+        if short_code in links_db:
+            link_data = links_db[short_code]
+            original_url = link_data.get("original_url")
+            
+            # تحديث عدد النقرات
+            link_data["clicks"] = link_data.get("clicks", 0) + 1
+            save_links(links_db)
+            
+            logger.info(f"✅ إعادة توجيه ناجحة: {short_code} → {original_url}")
+            
+            # توجيه 302 صحيح
+            return redirect(original_url, code=302)
+        
+        logger.warning(f"⚠️ رابط مختصر غير موجود: {short_code}")
+        return jsonify({"error": "Link not found"}), 404
     
-    return {
-        "statusCode": 404,
-        "body": "Link not found"
-    }
+    except Exception as e:
+        logger.error(f"❌ خطأ في إعادة التوجيه: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ===========================
 # معالجات Slack
@@ -233,17 +271,60 @@ handler = SlackRequestHandler(app)
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
-    """معالج أحداث Slack"""
-    return handler.handle(request)
+    """معالج أحداث Slack - نقطة الاتصال الرئيسية"""
+    try:
+        logger.debug(f"📨 طلب Slack: {request.method}")
+        return handler.handle(request)
+    except Exception as e:
+        logger.error(f"❌ خطأ في معالجة حدث Slack: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ===========================
-# مسار الصحة
+# مسارات الصحة والتشخيص
 # ===========================
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     """فحص صحة التطبيق"""
-    return {"status": "ok"}, 200
+    try:
+        links_db = load_links()
+        return jsonify({
+            "status": "ok",
+            "app": "AzmX Shortener",
+            "total_links": len(links_db),
+            "base_url": BASE_URL
+        }), 200
+    except Exception as e:
+        logger.error(f"❌ خطأ في فحص الصحة: {e}")
+        return jsonify({"status": "error"}), 500
+
+@flask_app.route("/", methods=["GET"])
+def home():
+    """صفحة رئيسية بسيطة"""
+    return jsonify({
+        "app": "AzmX Shortener",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "slack": "/slack/events",
+            "redirect": "/{short_code}"
+        }
+    }), 200
+
+# ===========================
+# معالجات الأخطاء العامة
+# ===========================
+
+@flask_app.errorhandler(404)
+def not_found(error):
+    """معالج الأخطاء 404"""
+    return jsonify({"error": "Not found"}), 404
+
+@flask_app.errorhandler(500)
+def internal_error(error):
+    """معالج الأخطاء 500"""
+    logger.error(f"❌ خطأ 500: {error}")
+    return jsonify({"error": "Internal server error"}), 500
 
 # ===========================
 # تشغيل التطبيق
@@ -251,4 +332,5 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
+    logger.info(f"🚀 البوت يعمل على المنفذ {port}")
     flask_app.run(host="0.0.0.0", port=port, debug=False)
