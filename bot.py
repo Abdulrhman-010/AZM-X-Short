@@ -8,6 +8,7 @@ from datetime import datetime
 from flask import Flask, request, redirect, jsonify
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 # ===========================
 # إعداد السجلات (Logging)
@@ -21,20 +22,25 @@ logger = logging.getLogger(__name__)
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")  # جديد لـ Socket Mode
 BASE_URL = os.environ.get("BASE_URL", "https://azmx-shortener.railway.app")
 
 # تحقق من وجود المتغيرات الضرورية
 if not SLACK_BOT_TOKEN or not SLACK_SIGNING_SECRET:
     logger.error("❌ SLACK_BOT_TOKEN أو SLACK_SIGNING_SECRET غير موجود!")
-    raise ValueError("Missing required environment variables")
+    raise ValueError("Missing required Slack tokens")
+
+if not SLACK_APP_TOKEN:
+    logger.error("❌ SLACK_APP_TOKEN غير موجود! مطلوب لـ Socket Mode")
+    raise ValueError("Missing SLACK_APP_TOKEN for Socket Mode")
 
 logger.info(f"✅ البوت يبدأ بـ BASE_URL: {BASE_URL}")
 
-# تهيئة تطبيق Slack
+# تهيئة تطبيق Slack مع Socket Mode
 app = App(
     token=SLACK_BOT_TOKEN,
     signing_secret=SLACK_SIGNING_SECRET,
-    process_before_response=True  # معالجة الطلب بشكل غير متزامن
+    process_before_response=True
 )
 
 # تهيئة Flask
@@ -118,11 +124,11 @@ def generate_short_code(length=6):
 def is_valid_url(url):
     """التحقق من صحة الرابط بدقة أعلى"""
     url_pattern = re.compile(
-        r'^https?://'  # البروتوكول
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)*[A-Z]{2,}\.?|'  # النطاق
-        r'localhost|'  # localhost
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # عنوان IP
-        r'(?::\d+)?'  # المنفذ
+        r'^https?://'
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)*[A-Z]{2,}\.?|'
+        r'localhost|'
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        r'(?::\d+)?'
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
     
     try:
@@ -212,7 +218,7 @@ def handle_short_command(ack, body, respond):
         short_code = create_short_url(original_url)
         short_url = f"{BASE_URL}/{short_code}"
         
-        # تشكيل الرسالة بصيغة Block Kit (أفضل وأجمل)
+        # تشكيل الرسالة
         message_text = (
             f"{MESSAGES['SUCCESS']['ar']}\n\n"
             f"*{MESSAGES['ORIGINAL_URL']['ar']}*\n"
@@ -264,22 +270,6 @@ def redirect_short_url(short_code):
         return jsonify({"error": "Internal server error"}), 500
 
 # ===========================
-# معالجات Slack
-# ===========================
-
-handler = SlackRequestHandler(app)
-
-@flask_app.route("/slack/events", methods=["POST"])
-def slack_events():
-    """معالج أحداث Slack - نقطة الاتصال الرئيسية"""
-    try:
-        logger.debug(f"📨 طلب Slack: {request.method}")
-        return handler.handle(request)
-    except Exception as e:
-        logger.error(f"❌ خطأ في معالجة حدث Slack: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-# ===========================
 # مسارات الصحة والتشخيص
 # ===========================
 
@@ -292,7 +282,8 @@ def health_check():
             "status": "ok",
             "app": "AzmX Shortener",
             "total_links": len(links_db),
-            "base_url": BASE_URL
+            "base_url": BASE_URL,
+            "socket_mode": "enabled"
         }), 200
     except Exception as e:
         logger.error(f"❌ خطأ في فحص الصحة: {e}")
@@ -303,10 +294,10 @@ def home():
     """صفحة رئيسية بسيطة"""
     return jsonify({
         "app": "AzmX Shortener",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "mode": "Socket Mode",
         "endpoints": {
             "health": "/health",
-            "slack": "/slack/events",
             "redirect": "/{short_code}"
         }
     }), 200
@@ -327,10 +318,26 @@ def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
 # ===========================
-# تشغيل التطبيق
+# تشغيل التطبيق مع Socket Mode
 # ===========================
 
 if __name__ == "__main__":
+    # تشغيل Socket Mode في thread منفصل
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    
+    # بدء Flask في thread رئيسي (للتوافق مع Railway)
     port = int(os.environ.get("PORT", 3000))
-    logger.info(f"🚀 البوت يعمل على المنفذ {port}")
-    flask_app.run(host="0.0.0.0", port=port, debug=False)
+    logger.info(f"🚀 البوت يعمل على المنفذ {port} مع Socket Mode")
+    logger.info(f"📡 الاتصال عبر WebSocket (Socket Mode) - البوت سيظهر Online دائماً")
+    
+    try:
+        # بدء handler بشكل غير متزامن
+        from threading import Thread
+        handler_thread = Thread(target=handler.start, daemon=True)
+        handler_thread.start()
+        
+        # تشغيل Flask
+        flask_app.run(host="0.0.0.0", port=port, debug=False)
+    except Exception as e:
+        logger.error(f"❌ خطأ في بدء التطبيق: {e}", exc_info=True)
+        raise
